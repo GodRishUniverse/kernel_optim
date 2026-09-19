@@ -1,11 +1,21 @@
-"""Qwen3 4B engine: hand-rolled forward, static KV cache, CUDA-graph decode.
+"""Qwen3 4B engine: hand-rolled forward, static KV cache, CUDA-graph decode,
+prompt-lookup speculative decoding with exact greedy verification.
 
 Prefill runs eagerly (cuBLAS GEMMs + SDPA flash attention, as the reference
-does). Each decode step is one CUDA graph replay: fused Triton kernels for
-norms / RoPE / SwiGLU / split-K GQA attention, fused QKV and gate-up GEMMs,
-and an in-graph argmax that feeds the next step. Token ids are copied to host
-one step behind the GPU so the host never stalls the device.
+does). Decode replays CUDA graphs built from fused Triton kernels (norms, RoPE,
+SwiGLU, split-K GQA attention) and fused QKV / gate-up GEMMs.
+
+Speculation: each step feeds every sequence its last token plus K tokens
+drafted by n-gram lookup over its own prompt + output, verifies all K+1
+positions in one forward (causal attention over the block), and keeps the
+longest drafted prefix that matches the model's own argmax, plus the model's
+next token. Every emitted token is therefore the model's greedy choice on its
+own prefix. If acceptance is too low to pay for the host round trip, the engine
+drops to a pipelined one-token graph for the rest of the generation.
 """
+
+import os
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -14,13 +24,98 @@ from transformers import AutoModelForCausalLM
 from kernels.fused import DecodeAttention, add_rms_norm, qk_norm_rope, silu_mul
 
 DEVICE = "cuda:0"
+NGRAMS = (3, 2, 1)          # draft lookup, longest match first
+PROBE_STEPS = 6             # speculative steps before judging acceptance
+MIN_ADVANCE = float(os.environ.get("ENGINE_MIN_ADVANCE", "1.25"))
+LOG = os.environ.get("ENGINE_LOG", "1") == "1"
+
+
+def draft_len(B):
+    """Draft tokens per sequence; verify rows B*(K+1) stay in the GEMV regime."""
+    if B <= 2:
+        return 6
+    if B <= 8:
+        return 4
+    if B <= 16:
+        return 3
+    if B <= 32:
+        return 1
+    return 0
+
+
+class _Lookup:
+    """Incremental n-gram index over one sequence: ngram -> latest continuation index."""
+
+    __slots__ = ("seq", "maps")
+
+    def __init__(self, seq):
+        self.seq = seq
+        self.maps = {n: {} for n in NGRAMS}
+        for i in range(1, len(seq)):
+            self._index(i)
+
+    def _index(self, i):
+        # ngram ending at seq[i-1] is continued by seq[i]
+        s = self.seq
+        for n in NGRAMS:
+            if i >= n:
+                self.maps[n][tuple(s[i - n:i])] = i
+
+    def append(self, toks):
+        for t in toks:
+            self.seq.append(t)
+            self._index(len(self.seq) - 1)
+
+    def draft(self, K):
+        s = self.seq
+        L = len(s)
+        for n in NGRAMS:
+            j = self.maps[n].get(tuple(s[L - n:]))
+            if j is not None:
+                out = []
+                for k in range(K):  # continuation may run into the draft itself (loops)
+                    idx = j + k
+                    out.append(s[idx] if idx < L else out[idx - L])
+                return out
+        return [s[-1]] * K
+
+
+def _prefill_attention(q, k, v, native_gqa):
+    """Causal attention, q [B, NQ, S, D], k/v [B, NKV, S, D] (strided cache views).
+
+    Same flash kernel the reference reaches through repeat_kv + SDPA; with
+    native GQA support it reads the 8 KV heads in place instead of writing
+    4 copies of them to HBM every layer.
+    """
+    scale = q.shape[-1] ** -0.5
+    if native_gqa:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale, enable_gqa=True)
+    B, nkv, S, D = k.shape
+    rep = q.shape[1] // nkv
+    k = k[:, :, None].expand(B, nkv, rep, S, D).reshape(B, nkv * rep, S, D)
+    v = v[:, :, None].expand(B, nkv, rep, S, D).reshape(B, nkv * rep, S, D)
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+
+
+def _probe_native_gqa():
+    """Use enable_gqa only if this torch supports it and it is bit-identical."""
+    try:
+        g = torch.Generator(device=DEVICE).manual_seed(0)
+        q = torch.randn(2, 32, 300, 128, device=DEVICE, dtype=torch.bfloat16, generator=g)
+        k = torch.randn(2, 8, 300, 128, device=DEVICE, dtype=torch.bfloat16, generator=g)
+        v = torch.randn(2, 8, 300, 128, device=DEVICE, dtype=torch.bfloat16, generator=g)
+        ok = torch.equal(_prefill_attention(q, k, v, True), _prefill_attention(q, k, v, False))
+    except Exception:
+        ok = False
+    if LOG:
+        print(f"[engine] native GQA prefill attention: {ok}", file=sys.stderr, flush=True)
+    return ok
 
 
 class Engine:
     def __init__(self, model_path: str) -> None:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
         model = AutoModelForCausalLM.from_pretrained(
             model_path, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
             local_files_only=True,
@@ -29,11 +124,9 @@ class Engine:
         self.nq = cfg.num_attention_heads
         self.nkv = cfg.num_key_value_heads
         self.d = getattr(cfg, "head_dim", cfg.hidden_size // self.nq)
-        self.hidden = cfg.hidden_size
         self.inter = cfg.intermediate_size
         self.eps = cfg.rms_norm_eps
         self.n_layers = cfg.num_hidden_layers
-        self.max_pos = cfg.max_position_embeddings
         self.rotary = model.model.rotary_emb
 
         base = model.model
@@ -54,7 +147,6 @@ class Engine:
                     gu=torch.cat([m.gate_proj.weight, m.up_proj.weight], 0).contiguous(),
                     down=m.down_proj.weight,
                 ))
-                # drop the now-duplicated projection weights
                 a.q_proj = a.k_proj = a.v_proj = None
                 m.gate_proj = m.up_proj = None
         del model
@@ -62,8 +154,7 @@ class Engine:
 
         self._cos = self._sin = None
         self._shape = None
-        self.graph = None
-        self._host = None
+        self.gqa_native = _probe_native_gqa()
 
     # ------------------------------------------------------------------ setup
     def _rope_tables(self, n):
@@ -75,31 +166,67 @@ class Engine:
         self._cos = cos[0].contiguous()
         self._sin = sin[0].contiguous()
 
-    def _setup(self, B, S, max_new):
-        cap = S + max_new
-        key = (B, cap)
+    def _setup(self, B, S, N):
+        key = (B, S, N)
         if self._shape == key:
             return
-        self.graph = None
         self._shape = None
+        self.g1 = self.gk = None
         self.k_cache = self.v_cache = None
         torch.cuda.empty_cache()
+
+        self.K = draft_len(B) if N > 2 else 0
+        # a sequence can run ahead of the slowest one by up to N (+K) tokens
+        cap = S + 2 * N + 2 * self.K + 2
         self._rope_tables(cap)
-        L, nkv, d = self.n_layers, self.nkv, self.d
-        self.k_cache = torch.zeros(L, B, nkv, cap, d, dtype=torch.bfloat16, device=DEVICE)
+        self.k_cache = torch.zeros(self.n_layers, B, self.nkv, cap, self.d, dtype=torch.bfloat16, device=DEVICE)
         self.v_cache = torch.zeros_like(self.k_cache)
-        self.pos = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+        self.pos = torch.zeros(B, dtype=torch.int32, device=DEVICE)
         self.ids = torch.zeros(B, dtype=torch.int64, device=DEVICE)
-        self.attn = DecodeAttention(B, cap, self.nq, nkv, d, DEVICE)
         self.B, self.cap = B, cap
-        self._capture()
+        self.pin_ids1 = torch.empty(N + 1, B, dtype=torch.int64, pin_memory=True)
+        self.events = [torch.cuda.Event() for _ in range(N + 1)]
+        self.pin_pos = torch.empty(B, dtype=torch.int32, pin_memory=True)
+
+        self.attn1 = DecodeAttention(B, 1, cap, self.nq, self.nkv, self.d, DEVICE)
+        self.g1 = self._capture(self._step1)
+        if self.K:
+            T = self.K + 1
+            self.attnk = DecodeAttention(B, T, cap, self.nq, self.nkv, self.d, DEVICE)
+            self.vin = torch.zeros(B, T, dtype=torch.int64, device=DEVICE)
+            self.vout = torch.zeros(B, T, dtype=torch.int64, device=DEVICE)
+            self.pin_vin = torch.empty(B, T, dtype=torch.int64, pin_memory=True)
+            self.pin_vout = torch.empty(B, T, dtype=torch.int64, pin_memory=True)
+            self.gk = self._capture(self._stepk)
         self._shape = key
 
+    def _capture(self, fn):
+        # Warm up (compiles Triton kernels, cuBLAS handles) on a side stream,
+        # then capture. The cache is scratch here; prefill resets positions.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                self.pos.zero_()
+                fn()
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        self.pos.zero_()
+        with torch.cuda.graph(g):
+            fn()
+        torch.cuda.synchronize()
+        return g
+
     # ---------------------------------------------------------------- forward
-    def _layers(self, x, B, T, attn_fn):
-        """x: embedded tokens [B*T, H]; returns final-normed hidden of last token per sequence."""
+    def _layers(self, x, B, T, attn_fn, all_rows):
+        """x: embedded tokens [B*T, H] (consumed as the residual stream).
+
+        Returns final-normed hidden states: every row if all_rows, else the
+        last token of each sequence.
+        """
         M = B * T
-        h = x  # residual stream, updated in place
+        h = x
         n = torch.empty_like(h)
         q = torch.empty(M, self.nq * self.d, dtype=torch.bfloat16, device=DEVICE)
         act = torch.empty(M, self.inter, dtype=torch.bfloat16, device=DEVICE)
@@ -115,7 +242,7 @@ class Engine:
             gu = torch.mm(n, lw["gu"].t())
             silu_mul(gu, act)
             delta = torch.mm(act, lw["down"].t())
-        if T > 1:
+        if T > 1 and not all_rows:
             last = torch.arange(B, device=DEVICE) * T + (T - 1)
             h, delta = h[last].contiguous(), delta[last].contiguous()
         out = torch.empty_like(h)
@@ -126,74 +253,151 @@ class Engine:
         B, S = prompt.shape
         self.pos.zero_()
         x = F.embedding(prompt.reshape(-1), self.embed)
-        nq, nkv, d = self.nq, self.nkv, self.d
-        rep = nq // nkv
+        nq, d = self.nq, self.d
 
         def attn(i, q):
             qh = q.view(B, S, nq, d).transpose(1, 2)
             k = self.k_cache[i][:, :, :S]
             v = self.v_cache[i][:, :, :S]
-            k = k[:, :, None].expand(B, nkv, rep, S, d).reshape(B, nq, S, d)
-            v = v[:, :, None].expand(B, nkv, rep, S, d).reshape(B, nq, S, d)
-            o = F.scaled_dot_product_attention(qh, k, v, is_causal=True, scale=d ** -0.5)
-            return o.transpose(1, 2).reshape(B * S, nq * d)
+            return _prefill_attention(qh, k, v, self.gqa_native).transpose(1, 2).reshape(B * S, nq * d)
 
-        hn = self._layers(x, B, S, attn)
+        hn = self._layers(x, B, S, attn, all_rows=False)
         logits = torch.mm(hn, self.lm_head.t())
         self.ids.copy_(torch.argmax(logits, dim=-1))
         self.pos.fill_(S)
 
-    def _decode_step(self):
+    def _step1(self):
+        """One token per sequence at pos[b]; argmax feeds ids, positions advance."""
         B = self.B
         x = F.embedding(self.ids, self.embed)
         out = torch.empty(B, self.nq * self.d, dtype=torch.bfloat16, device=DEVICE)
 
         def attn(i, q):
-            self.attn(q, self.k_cache[i], self.v_cache[i], self.pos, out)
+            self.attn1(q, self.k_cache[i], self.v_cache[i], self.pos, out)
             return out
 
-        hn = self._layers(x, B, 1, attn)
+        hn = self._layers(x, B, 1, attn, all_rows=True)
         logits = torch.mm(hn, self.lm_head.t())
         torch.argmax(logits, dim=-1, out=self.ids)
         self.pos.add_(1)
 
-    def _capture(self):
-        # Warm up (compiles Triton kernels, cuBLAS handles) on a side stream,
-        # then capture. The cache is scratch here; it is reset by prefill.
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(2):
-                self.pos.zero_()
-                self._decode_step()
-        torch.cuda.current_stream().wait_stream(s)
-        torch.cuda.synchronize()
-        self.graph = torch.cuda.CUDAGraph()
-        self.pos.zero_()
-        with torch.cuda.graph(self.graph):
-            self._decode_step()
-        torch.cuda.synchronize()
+    def _stepk(self):
+        """Verify: vin[b] = last token + K drafts at pos[b].. -> vout = argmax at each."""
+        B, T = self.B, self.K + 1
+        x = F.embedding(self.vin.view(-1), self.embed)
+        out = torch.empty(B * T, self.nq * self.d, dtype=torch.bfloat16, device=DEVICE)
+
+        def attn(i, q):
+            self.attnk(q, self.k_cache[i], self.v_cache[i], self.pos, out)
+            return out
+
+        hn = self._layers(x, B, T, attn, all_rows=True)
+        logits = torch.mm(hn, self.lm_head.t())
+        torch.argmax(logits, dim=-1, out=self.vout.view(-1))
 
     # --------------------------------------------------------------- generate
     @torch.inference_mode()
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
-        if max_new_tokens <= 0:
+        N = max_new_tokens
+        if N <= 0:
             return
         B, S = len(input_ids), len(input_ids[0])
-        self._setup(B, S, max_new_tokens)
-        prompt = torch.tensor(input_ids, dtype=torch.int64, device=DEVICE)
-        if self._host is None or self._host.shape[0] < max_new_tokens or self._host.shape[1] != B:
-            self._host = torch.empty(max_new_tokens, B, dtype=torch.int64, pin_memory=True)
-            self._events = [torch.cuda.Event() for _ in range(max_new_tokens)]
-        host, events = self._host, self._events
-
+        self._setup(B, S, N)
         stream = torch.cuda.current_stream()
+
+        prompt = torch.tensor(input_ids, dtype=torch.int64, device=DEVICE)
         self._prefill(prompt)
-        for step in range(max_new_tokens):
-            # tokens for `step` are in self.ids; stash them, then launch the next step
-            host[step].copy_(self.ids, non_blocking=True)  # stream-ordered before the replay overwrites ids
-            events[step].record(stream)
-            if step + 1 < max_new_tokens:
-                self.graph.replay()
-            events[step].synchronize()
-            yield host[step].tolist()
+        self.pin_ids1[0].copy_(self.ids, non_blocking=True)
+        self.events[0].record(stream)
+        # Build draft indexes while the GPU runs prefill.
+        look = [_Lookup(list(row)) for row in input_ids] if self.K else None
+        self.events[0].synchronize()
+        first = self.pin_ids1[0].tolist()
+        yield first
+        if N == 1:
+            return
+
+        outs = [[t] for t in first]   # generated tokens per sequence
+        emitted = 1
+        spec_steps = 0
+        if self.K:
+            K, T = self.K, self.K + 1
+            for b in range(B):
+                look[b].append([first[b]])
+            vin, vout, ppos = self.pin_vin, self.pin_vout, self.pin_pos
+            # a frozen (finished) sequence keeps its position; its rows are ignored
+            start_min = 1
+            while emitted < N:
+                rows, plist = [], []
+                for b in range(B):
+                    seq = look[b].seq
+                    rows.append([seq[-1]] + look[b].draft(K))
+                    plist.append(len(seq) - 1)
+                vin.copy_(torch.tensor(rows))
+                ppos.copy_(torch.tensor(plist, dtype=torch.int32))
+                self.vin.copy_(vin, non_blocking=True)
+                self.pos.copy_(ppos, non_blocking=True)
+                self.gk.replay()
+                vout.copy_(self.vout, non_blocking=True)
+                self.events[1].record(stream)
+                self.events[1].synchronize()
+                spec_steps += 1
+                g = vout.tolist()
+                d = vin.tolist()
+                for b in range(B):
+                    if len(outs[b]) >= N:
+                        continue  # finished: frozen, its rows are ignored
+                    gb, db = g[b], d[b]
+                    a = 0
+                    while a < K and db[a + 1] == gb[a]:
+                        a += 1
+                    new = gb[:a + 1]
+                    outs[b].extend(new)
+                    look[b].append(new)
+                ready = min(len(o) for o in outs)
+                while emitted < min(ready, N):
+                    yield [o[emitted] for o in outs]
+                    emitted += 1
+                if spec_steps == PROBE_STEPS and emitted < N:
+                    advance = (ready - start_min) / spec_steps
+                    if advance < MIN_ADVANCE:
+                        break  # not paying for itself: finish on the pipelined path
+            if emitted >= N:
+                self._log(B, S, N, spec_steps, 0, outs)
+                return
+            # hand the per-sequence state to the one-token graph
+            for b in range(B):
+                vin[b, 0] = outs[b][-1]
+                ppos[b] = S + len(outs[b]) - 1
+            self.ids.copy_(vin[:, 0], non_blocking=True)
+            self.pos.copy_(ppos, non_blocking=True)
+        # Pipelined one-token decode: the next replay is queued before the host
+        # waits on the previous step's ids.
+        steps = N - min(len(o) for o in outs)
+        ids_h, ev = self.pin_ids1, self.events
+        for j in range(1, steps + 1):
+            self.g1.replay()
+            ids_h[j].copy_(self.ids, non_blocking=True)
+            ev[j].record(stream)
+            if j > 1:
+                yield from self._drain(ids_h, ev, j - 1, outs, N, emitted)
+                emitted = min(N, min(len(o) for o in outs))
+        if steps:
+            yield from self._drain(ids_h, ev, steps, outs, N, emitted)
+        self._log(B, S, N, spec_steps, steps, outs)
+
+    def _drain(self, ids_h, ev, j, outs, N, emitted):
+        ev[j].synchronize()
+        toks = ids_h[j].tolist()
+        for b, o in enumerate(outs):
+            o.append(toks[b])
+        ready = min(N, min(len(o) for o in outs))
+        while emitted < ready:
+            yield [o[emitted] for o in outs]
+            emitted += 1
+
+    def _log(self, B, S, N, spec_steps, plain_steps, outs):
+        if LOG:
+            print(f"[engine] B={B} S={S} N={N} K={self.K} spec_steps={spec_steps} "
+                  f"plain_steps={plain_steps} forwards={1 + spec_steps + plain_steps}",
+                  file=sys.stderr, flush=True)

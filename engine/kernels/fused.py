@@ -49,7 +49,7 @@ def add_rms_norm(res, delta, weight, out, eps):
 # ---------------------------------------------------------------------------
 # Per-head q/k RMSNorm + RoPE, writing K/V straight into the cache.
 # qkv: [M, (NQ + 2*NKV) * D] with M = B*T rows; token row m is batch m // T,
-# position pos0 + m % T, where pos0 is read from a device scalar.
+# position pos[b] + m % T, with pos[B] read from device memory.
 # ---------------------------------------------------------------------------
 @triton.jit
 def _qk_norm_rope_kernel(
@@ -65,7 +65,7 @@ def _qk_norm_rope_kernel(
     d = tl.arange(0, D)
     d_rot = (d + HALF) % D
     b = m // T
-    pos = tl.load(pos_ptr).to(tl.int64) + m % T
+    pos = tl.load(pos_ptr + b).to(tl.int64) + m % T
     base = qkv_ptr + m * ROW + h * D
     if h < NQ + NKV:
         x = tl.load(base + d).to(tl.float32)
@@ -128,36 +128,42 @@ def silu_mul(gu, out):
 
 
 # ---------------------------------------------------------------------------
-# Decode attention (one query token per sequence), GQA-aware split-K
-# flash-decoding over a fixed-capacity cache. Valid length = pos + 1, read
-# from device memory so the step can live inside a CUDA graph.
+# Decode / verify attention: T query tokens per sequence at positions
+# pos[b] .. pos[b]+T-1, causal among themselves, against a fixed-capacity
+# cache. GQA-aware split-K flash-decoding: one program reads a KV head's slice
+# once for all T * GROUP query rows that share it. Positions live in device
+# memory so the step can be replayed from a CUDA graph.
+# q/out rows are laid out [(b*T + t), NQ*D].
 # ---------------------------------------------------------------------------
 @triton.jit
 def _decode_attn_kernel(
     q_ptr, k_ptr, v_ptr, pos_ptr, o_ptr, ml_ptr,
     cache_b_stride, cache_h_stride, chunk, scale,
-    NQ: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr, NSPLIT: tl.constexpr,
-    GROUP: tl.constexpr, GPAD: tl.constexpr, BLOCK_N: tl.constexpr,
+    T: tl.constexpr, NQ: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr, NSPLIT: tl.constexpr,
+    GROUP: tl.constexpr, RPAD: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     bh = tl.program_id(0)
     split = tl.program_id(1)
     b = (bh // NKV).to(tl.int64)
     kh = bh % NKV
-    length = tl.load(pos_ptr).to(tl.int32) + 1
+    p0 = tl.load(pos_ptr + b).to(tl.int32)
     start = split * chunk
-    end = tl.minimum(start + chunk, length)
+    end = tl.minimum(start + chunk, p0 + T)
 
-    g = tl.arange(0, GPAD)
+    r = tl.arange(0, RPAD)
+    t = r // GROUP
+    qh = kh * GROUP + r % GROUP
+    rmask = r < T * GROUP
+    row = (b * T + t) * NQ + qh
     d = tl.arange(0, D)
-    gmask = g < GROUP
-    qh = kh * GROUP + g
-    q = tl.load(q_ptr + b * NQ * D + qh[:, None] * D + d[None, :], mask=gmask[:, None], other=0.0)
+    q = tl.load(q_ptr + row[:, None] * D + d[None, :], mask=rmask[:, None], other=0.0)
+    limit = p0 + t  # last visible key per query row
 
     k_base = k_ptr + b * cache_b_stride + kh * cache_h_stride
     v_base = v_ptr + b * cache_b_stride + kh * cache_h_stride
-    m_i = tl.full([GPAD], -1.0e30, tl.float32)
-    l_i = tl.zeros([GPAD], tl.float32)
-    acc = tl.zeros([GPAD, D], tl.float32)
+    m_i = tl.full([RPAD], -1.0e30, tl.float32)
+    l_i = tl.zeros([RPAD], tl.float32)
+    acc = tl.zeros([RPAD, D], tl.float32)
     n = tl.arange(0, BLOCK_N)
     for s0 in range(start, end, BLOCK_N):
         idx = s0 + n
@@ -165,7 +171,7 @@ def _decode_attn_kernel(
         k = tl.load(k_base + idx[:, None] * D + d[None, :], mask=nmask[:, None], other=0.0)
         v = tl.load(v_base + idx[:, None] * D + d[None, :], mask=nmask[:, None], other=0.0)
         s = tl.dot(q, tl.trans(k)) * scale
-        s = tl.where(nmask[None, :], s, float("-inf"))
+        s = tl.where(idx[None, :] <= limit[:, None], s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(s - m_new[:, None])
@@ -173,15 +179,15 @@ def _decode_attn_kernel(
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         m_i = m_new
 
-    part = (b * NQ + qh) * NSPLIT + split
-    tl.store(o_ptr + part[:, None] * D + d[None, :], acc, mask=gmask[:, None])
-    tl.store(ml_ptr + part * 2, m_i, mask=gmask)
-    tl.store(ml_ptr + part * 2 + 1, l_i, mask=gmask)
+    part = row * NSPLIT + split
+    tl.store(o_ptr + part[:, None] * D + d[None, :], acc, mask=rmask[:, None])
+    tl.store(ml_ptr + part * 2, m_i, mask=rmask)
+    tl.store(ml_ptr + part * 2 + 1, l_i, mask=rmask)
 
 
 @triton.jit
 def _decode_combine_kernel(o_ptr, ml_ptr, out_ptr, D: tl.constexpr, NSPLIT: tl.constexpr, SPAD: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)  # b * NQ + head
+    row = tl.program_id(0).to(tl.int64)  # (b*T + t) * NQ + head
     sp = tl.arange(0, SPAD)
     smask = sp < NSPLIT
     d = tl.arange(0, D)
@@ -196,32 +202,33 @@ def _decode_combine_kernel(o_ptr, ml_ptr, out_ptr, D: tl.constexpr, NSPLIT: tl.c
 
 
 class DecodeAttention:
-    """Preallocated split-K decode attention for a fixed (B, cap)."""
+    """Preallocated split-K attention for T query tokens per sequence, fixed (B, T, cap)."""
 
     BLOCK_N = 64
 
-    def __init__(self, B, cap, nq, nkv, d, device, target_ctas=264):
-        self.B, self.nq, self.nkv, self.d = B, nq, nkv, d
+    def __init__(self, B, T, cap, nq, nkv, d, device, target_ctas=264):
+        self.B, self.T, self.nq, self.nkv, self.d = B, T, nq, nkv, d
         max_split = max(1, triton.cdiv(cap, 128))
         nsplit = max(1, min(max_split, triton.cdiv(target_ctas, B * nkv)))
         chunk = triton.cdiv(triton.cdiv(cap, nsplit), self.BLOCK_N) * self.BLOCK_N
         self.nsplit = triton.cdiv(cap, chunk)
         self.chunk = chunk
-        self.o_part = torch.empty(B * nq * self.nsplit * d, dtype=torch.float32, device=device)
-        self.ml = torch.empty(B * nq * self.nsplit * 2, dtype=torch.float32, device=device)
+        rows = B * T * nq
+        self.o_part = torch.empty(rows * self.nsplit * d, dtype=torch.float32, device=device)
+        self.ml = torch.empty(rows * self.nsplit * 2, dtype=torch.float32, device=device)
         self.scale = d ** -0.5
 
     def __call__(self, q, k_cache, v_cache, pos, out):
-        """q: [B, NQ*D]; k/v_cache: [B, NKV, cap, D]; out: [B, NQ*D]."""
+        """q: [B*T, NQ*D]; k/v_cache: [B, NKV, cap, D]; pos: [B] int32; out: [B*T, NQ*D]."""
         group = self.nq // self.nkv
         _decode_attn_kernel[(self.B * self.nkv, self.nsplit)](
             q, k_cache, v_cache, pos, self.o_part, self.ml,
             k_cache.stride(0), k_cache.stride(1), self.chunk, self.scale,
-            NQ=self.nq, NKV=self.nkv, D=self.d, NSPLIT=self.nsplit,
-            GROUP=group, GPAD=max(16, triton.next_power_of_2(group)),
+            T=self.T, NQ=self.nq, NKV=self.nkv, D=self.d, NSPLIT=self.nsplit,
+            GROUP=group, RPAD=max(16, triton.next_power_of_2(self.T * group)),
             BLOCK_N=self.BLOCK_N, num_warps=4, num_stages=2,
         )
-        _decode_combine_kernel[(self.B * self.nq,)](
+        _decode_combine_kernel[(self.B * self.T * self.nq,)](
             self.o_part, self.ml, out, D=self.d, NSPLIT=self.nsplit,
             SPAD=max(2, triton.next_power_of_2(self.nsplit)), num_warps=1,
         )
