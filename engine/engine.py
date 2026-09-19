@@ -1,17 +1,21 @@
 """Qwen3 4B engine: hand-rolled forward, static KV cache, CUDA-graph decode,
 prompt-lookup speculative decoding with exact greedy verification.
 
-Prefill runs eagerly (cuBLAS GEMMs + SDPA flash attention, as the reference
-does). Decode replays CUDA graphs built from fused Triton kernels (norms, RoPE,
-SwiGLU, split-K GQA attention) and fused QKV / gate-up GEMMs.
+Prefill (cuBLAS GEMMs + SDPA flash attention, as the reference does) and
+decode both replay CUDA graphs captured at warmup. Decode uses fused Triton
+kernels (norms, RoPE, SwiGLU, split-K GQA attention) and fused QKV / gate-up
+projections.
 
 Speculation: each step feeds every sequence its last token plus K tokens
 drafted by n-gram lookup over its own prompt + output, verifies all K+1
 positions in one forward (causal attention over the block), and keeps the
 longest drafted prefix that matches the model's own argmax, plus the model's
 next token. Every emitted token is therefore the model's greedy choice on its
-own prefix. If acceptance is too low to pay for the host round trip, the engine
-drops to a pipelined one-token graph for the rest of the generation.
+own prefix. Decode is bandwidth-bound, so verifying K+1 tokens costs about
+the same as one; the price is the host round trip each step. Warmup measures
+both graphs, giving the break-even tokens per step; if a window of steps falls
+below it, the engine drops to the pipelined one-token graph for the rest of
+the generation.
 """
 
 import os
@@ -28,26 +32,24 @@ from kernels.gemv import EPI_BF16, EPI_F32, EPI_RESID, EPI_SWIGLU, Gemv, embed_s
 
 DEVICE = "cuda:0"
 NGRAMS = (3, 2, 1)          # draft lookup, longest match first
-PROBE_STEPS = 6             # speculative steps before judging acceptance
-MIN_ADVANCE = float(os.environ.get("ENGINE_MIN_ADVANCE", "1.25"))
+WINDOW = 8                  # speculative steps per acceptance check
+HOST_MS = 0.2               # host round trip per speculative step (sync, draft, H2D)
+# Tokens per step (slowest sequence) below which speculation is abandoned; None = measured.
+MIN_ADVANCE = float(os.environ["ENGINE_MIN_ADVANCE"]) if "ENGINE_MIN_ADVANCE" in os.environ else None
 LOG = os.environ.get("ENGINE_LOG", "1") == "1"
-# Prompt-lookup drafts rarely match on the judge's prompts; the probe steps cost
-# more than they save, so speculation is opt-in.
-SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"
+SPEC = os.environ.get("ENGINE_SPEC", "1") == "1"
 FUSED_MAX_B = 64            # fused-GEMV decode up to this batch; cuBLAS beyond
 TUNE_BUDGET_S = 150.0       # stop timing GEMV configs after this much of the load budget
 
 
 def draft_len(B):
     """Draft tokens per sequence; verify rows B*(K+1) stay in the GEMV regime."""
-    if B <= 2:
+    if B <= 4:
         return 6
-    if B <= 8:
-        return 4
     if B <= 16:
-        return 3
+        return 4
     if B <= 32:
-        return 1
+        return 2
     return 0
 
 
@@ -181,7 +183,7 @@ class Engine:
         if self._shape == key:
             return
         self._shape = None
-        self.g1 = self.gk = None
+        self.g1 = self.gk = self.gp = None
         self.k_cache = self.v_cache = None
         torch.cuda.empty_cache()
 
@@ -220,6 +222,17 @@ class Engine:
             self.pin_vin = torch.empty(B, T, dtype=torch.int64, pin_memory=True)
             self.pin_vout = torch.empty(B, T, dtype=torch.int64, pin_memory=True)
             self.gk = self._capture(self._stepk)
+            t1 = self._time_graph(self.g1, S)
+            tk = self._time_graph(self.gk, S)
+            self.breakeven = (tk + HOST_MS) / t1 if MIN_ADVANCE is None else MIN_ADVANCE
+            if LOG:
+                print(f"[engine] B={B} K={self.K}: step {t1 * 1e3:.0f}us verify {tk * 1e3:.0f}us "
+                      f"-> speculate while >= {self.breakeven:.3f} tokens/step",
+                      file=sys.stderr, flush=True)
+        # prefill graph for this exact prompt shape
+        self.prompt_buf = torch.zeros(B, S, dtype=torch.int64, device=DEVICE)
+        self.pin_prompt = torch.empty(B, S, dtype=torch.int64, pin_memory=True)
+        self.gp = self._capture(lambda: self._prefill(self.prompt_buf))
         self._shape = key
 
     def _time_graph(self, g, S, reps=10):
@@ -387,8 +400,9 @@ class Engine:
         self._setup(B, S, N)
         stream = torch.cuda.current_stream()
 
-        prompt = torch.tensor(input_ids, dtype=torch.int64, device=DEVICE)
-        self._prefill(prompt)
+        self.pin_prompt.copy_(torch.tensor(input_ids, dtype=torch.int64))
+        self.prompt_buf.copy_(self.pin_prompt, non_blocking=True)
+        self.gp.replay()
         self.pin_ids1[0].copy_(self.ids, non_blocking=True)
         self.events[0].record(stream)
         # Queue the first decode step before waiting on prefill, so the GPU keeps
@@ -416,8 +430,10 @@ class Engine:
                 look[b].append([first[b]])
             vin, vout, ppos = self.pin_vin, self.pin_vout, self.pin_pos
             # a frozen (finished) sequence keeps its position; its rows are ignored
-            start_min = 1
+            window_min = 1
+            host_s = 0.0
             while emitted < N:
+                t_host = time.perf_counter()
                 rows, plist = [], []
                 for b in range(B):
                     seq = look[b].seq
@@ -430,7 +446,9 @@ class Engine:
                 self.gk.replay()
                 vout.copy_(self.vout, non_blocking=True)
                 self.events[1].record(stream)
+                host_s += time.perf_counter() - t_host
                 self.events[1].synchronize()
+                t_host = time.perf_counter()
                 spec_steps += 1
                 g = vout.tolist()
                 d = vin.tolist()
@@ -445,13 +463,16 @@ class Engine:
                     outs[b].extend(new)
                     look[b].append(new)
                 ready = min(len(o) for o in outs)
+                host_s += time.perf_counter() - t_host
                 while emitted < min(ready, N):
                     yield [o[emitted] for o in outs]
                     emitted += 1
-                if spec_steps == PROBE_STEPS and emitted < N:
-                    advance = (ready - start_min) / spec_steps
-                    if advance < MIN_ADVANCE:
+                if spec_steps % WINDOW == 0 and emitted < N:
+                    advance = (ready - window_min) / WINDOW
+                    window_min = ready
+                    if advance < self.breakeven:
                         break  # not paying for itself: finish on the pipelined path
+            self.host_us = host_s / max(1, spec_steps) * 1e6
             if emitted >= N:
                 self._log(B, S, N, spec_steps, 0, outs)
                 return
@@ -490,5 +511,6 @@ class Engine:
     def _log(self, B, S, N, spec_steps, plain_steps, outs):
         if LOG:
             print(f"[engine] B={B} S={S} N={N} K={self.K} spec_steps={spec_steps} "
-                  f"plain_steps={plain_steps} forwards={1 + spec_steps + plain_steps}",
+                  f"plain_steps={plain_steps} forwards={1 + spec_steps + plain_steps}"
+                  + (f" host={self.host_us:.0f}us/spec-step" if spec_steps else ""),
                   file=sys.stderr, flush=True)
