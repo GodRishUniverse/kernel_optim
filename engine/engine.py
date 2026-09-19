@@ -16,18 +16,26 @@ drops to a pipelined one-token graph for the rest of the generation.
 
 import os
 import sys
+import time
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModelForCausalLM
 
 from kernels.fused import DecodeAttention, add_rms_norm, qk_norm_rope, silu_mul
+from kernels.gemv import EPI_BF16, EPI_F32, EPI_RESID, EPI_SWIGLU, Gemv, embed_ss, qk_norm_rope_acc
 
 DEVICE = "cuda:0"
 NGRAMS = (3, 2, 1)          # draft lookup, longest match first
 PROBE_STEPS = 6             # speculative steps before judging acceptance
 MIN_ADVANCE = float(os.environ.get("ENGINE_MIN_ADVANCE", "1.25"))
 LOG = os.environ.get("ENGINE_LOG", "1") == "1"
+# Prompt-lookup drafts rarely match on the judge's prompts; the probe steps cost
+# more than they save, so speculation is opt-in.
+SPEC = os.environ.get("ENGINE_SPEC", "0") == "1"
+FUSED_MAX_B = 64            # fused-GEMV decode up to this batch; cuBLAS beyond
+TUNE_BUDGET_S = 150.0       # stop timing GEMV configs after this much of the load budget
 
 
 def draft_len(B):
@@ -89,7 +97,8 @@ def _prefill_attention(q, k, v, native_gqa):
     """
     scale = q.shape[-1] ** -0.5
     if native_gqa:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale, enable_gqa=True)
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):  # never a slower fallback
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale, enable_gqa=True)
     B, nkv, S, D = k.shape
     rep = q.shape[1] // nkv
     k = k[:, :, None].expand(B, nkv, rep, S, D).reshape(B, nkv * rep, S, D)
@@ -114,6 +123,7 @@ def _probe_native_gqa():
 
 class Engine:
     def __init__(self, model_path: str) -> None:
+        self._t0 = time.monotonic()
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         model = AutoModelForCausalLM.from_pretrained(
@@ -175,7 +185,7 @@ class Engine:
         self.k_cache = self.v_cache = None
         torch.cuda.empty_cache()
 
-        self.K = draft_len(B) if N > 2 else 0
+        self.K = draft_len(B) if SPEC and N > 2 else 0
         # a sequence can run ahead of the slowest one by up to N (+K) tokens
         cap = S + 2 * N + 2 * self.K + 2
         self._rope_tables(cap)
@@ -190,6 +200,18 @@ class Engine:
 
         self.attn1 = DecodeAttention(B, 1, cap, self.nq, self.nkv, self.d, DEVICE)
         self.g1 = self._capture(self._step1)
+        if B <= FUSED_MAX_B:
+            # Keep whichever decode graph is faster on this GPU, measured here
+            # during the untimed warmup rather than assumed.
+            self._setup_fused(B)
+            fused = self._capture(self._step1_fused)
+            t_plain, t_fused = self._time_graph(self.g1, S), self._time_graph(fused, S)
+            t_plain, t_fused = min(t_plain, self._time_graph(self.g1, S)), min(t_fused, self._time_graph(fused, S))
+            if LOG:
+                print(f"[engine] decode step B={B}: cublas {t_plain * 1e3:.0f}us fused {t_fused * 1e3:.0f}us",
+                      file=sys.stderr, flush=True)
+            if t_fused < t_plain:
+                self.g1 = fused
         if self.K:
             T = self.K + 1
             self.attnk = DecodeAttention(B, T, cap, self.nq, self.nkv, self.d, DEVICE)
@@ -199,6 +221,66 @@ class Engine:
             self.pin_vout = torch.empty(B, T, dtype=torch.int64, pin_memory=True)
             self.gk = self._capture(self._stepk)
         self._shape = key
+
+    def _time_graph(self, g, S, reps=10):
+        torch.cuda.synchronize()
+        self.pos.fill_(S)
+        g.replay()
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a.record()
+        for _ in range(reps):
+            g.replay()
+        b.record()
+        torch.cuda.synchronize()
+        return a.elapsed_time(b) / reps
+
+    def _setup_fused(self, B):
+        H, I, V = self.embed.shape[1], self.inter, self.embed.shape[0]
+        nqkv = (self.nq + 2 * self.nkv) * self.d
+        bf = torch.bfloat16
+        self.h = torch.zeros(B, H, dtype=bf, device=DEVICE)
+        self.ss = torch.zeros(2, B, dtype=torch.float32, device=DEVICE)
+        self.acc_qkv = torch.zeros(B, nqkv, dtype=torch.float32, device=DEVICE)
+        self.q1 = torch.zeros(B, self.nq * self.d, dtype=bf, device=DEVICE)
+        self.attn_out = torch.zeros(B, self.nq * self.d, dtype=bf, device=DEVICE)
+        self.act = torch.zeros(B, I, dtype=bf, device=DEVICE)
+        self.logits = torch.zeros(B, V, dtype=bf, device=DEVICE)
+        eps = self.eps
+        lw = self.layers[0]
+        self.gv = dict(
+            qkv=(Gemv(B, nqkv, H, EPI_F32, norm=True, allow_split=True, eps=eps), lw["qkv"]),
+            o=(Gemv(B, H, self.nq * self.d, EPI_RESID, norm=False, eps=eps), lw["o"]),
+            gu=(Gemv(B, I, H, EPI_SWIGLU, norm=True, eps=eps), lw["gu"]),
+            down=(Gemv(B, H, I, EPI_RESID, norm=False, eps=eps), lw["down"]),
+            lm=(Gemv(B, V, H, EPI_BF16, norm=True, eps=eps), self.lm_head),
+        )
+        for name, (g, w) in self.gv.items():
+            if time.monotonic() - self._t0 < TUNE_BUDGET_S:
+                g.tune(w)
+            if LOG:
+                print(f"[engine] gemv {name} B={B} cfg={g.cfg}", file=sys.stderr, flush=True)
+        self.acc_qkv.zero_()
+        self.ss.zero_()
+
+    def _step1_fused(self):
+        """Decode step, 7 kernels per layer: norms ride in GEMV prologues, residual
+        adds and the next norm's sum of squares in GEMV epilogues."""
+        g = {k: v[0] for k, v in self.gv.items()}
+        h, ss = self.h, self.ss
+        embed_ss(self.ids, self.embed, h, ss[0])
+        for i, lw in enumerate(self.layers):
+            g["qkv"](h, lw["qkv"], y=self.acc_qkv, nw=lw["w_in"], ss=ss[0])
+            # consumes acc_qkv; zeroes both ss rows (ss[0] consumed above, ss[1] by the last gate-up)
+            qk_norm_rope_acc(self.acc_qkv, lw["q_norm"], lw["k_norm"], self._cos, self._sin, self.pos,
+                             self.q1, self.k_cache[i], self.v_cache[i], ss, self.eps,
+                             self.nq, self.nkv, self.d)
+            self.attn1(self.q1, self.k_cache[i], self.v_cache[i], self.pos, self.attn_out)
+            g["o"](self.attn_out, lw["o"], h=h, ss_out=ss[1])
+            g["gu"](h, lw["gu"], y=self.act, nw=lw["w_post"], ss=ss[1])
+            g["down"](self.act, lw["down"], h=h, ss_out=ss[0])
+        g["lm"](h, self.lm_head, y=self.logits, nw=self.final_norm, ss=ss[0])
+        torch.argmax(self.logits, dim=-1, out=self.ids)
+        self.pos.add_(1)
 
     def _capture(self, fn):
         # Warm up (compiles Triton kernels, cuBLAS handles) on a side stream,
@@ -309,6 +391,14 @@ class Engine:
         self._prefill(prompt)
         self.pin_ids1[0].copy_(self.ids, non_blocking=True)
         self.events[0].record(stream)
+        # Queue the first decode step before waiting on prefill, so the GPU keeps
+        # working while the first token is handed to the caller.
+        launched = 0
+        if not self.K and N > 1:
+            self.g1.replay()
+            self.pin_ids1[1].copy_(self.ids, non_blocking=True)
+            self.events[1].record(stream)
+            launched = 1
         # Build draft indexes while the GPU runs prefill.
         look = [_Lookup(list(row)) for row in input_ids] if self.K else None
         self.events[0].synchronize()
@@ -376,9 +466,10 @@ class Engine:
         steps = N - min(len(o) for o in outs)
         ids_h, ev = self.pin_ids1, self.events
         for j in range(1, steps + 1):
-            self.g1.replay()
-            ids_h[j].copy_(self.ids, non_blocking=True)
-            ev[j].record(stream)
+            if j > launched:
+                self.g1.replay()
+                ids_h[j].copy_(self.ids, non_blocking=True)
+                ev[j].record(stream)
             if j > 1:
                 yield from self._drain(ids_h, ev, j - 1, outs, N, emitted)
                 emitted = min(N, min(len(o) for o in outs))
